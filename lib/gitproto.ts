@@ -3,6 +3,7 @@ import { store, type Repository } from './store.ts';
 import { buildPack, decodePktLines, depthObjects, encodePktLine, encodePktLines, encodeSideband, lookupObject, objectHash, parseCommit, parsePack, parseTree, reachable, reachableDifference, ZERO_OID, type GitObject, type ObjectType } from './gitpack.ts';
 
 const depthOneCache = new Map<string, Buffer>();
+const depthOneResponseCache = new Map<string, Buffer>();
 const caps = ['report-status', 'side-band-64k', 'delete-refs', 'ofs-delta', 'agent=makefun-forge/1.0', 'object-format=sha1'];
 type Cmd = { old: string; next: string; ref: string };
 
@@ -133,7 +134,7 @@ function receivePack(repo: Repository, bytes: Buffer): Buffer {
     if (pack.length) {
       const objects = parsePack(pack);
       for (const [hash, object] of objects) {
-        store.gitObjects.set(hash, Buffer.from(object.data));
+        store.gitObjects.set(hash, object.data);
         store.gitObjectTypes.set(hash, object.type);
       }
     }
@@ -203,6 +204,9 @@ function fetchPack(repo: Repository, commands: string[]): Buffer {
   const oldShallow = new Set(commands.filter((line) => line.startsWith('shallow ')).map((line) => line.slice(8).trim()));
   const depthLine = commands.find((line) => line.startsWith('deepen '));
   const depth = depthLine ? Math.max(1, Number(depthLine.slice(7)) || 1) : 0;
+  const shallowCloneKey = depth === 1 && wants.length === 1 && haves.length === 0 ? `${repo.id}:${wants[0]}:1` : '';
+  const cachedResponse = shallowCloneKey === '' ? undefined : depthOneResponseCache.get(shallowCloneKey);
+  if (cachedResponse) return cachedResponse;
   let objects: string[] = [];
   let shallow: string[] = [];
   let unshallow: string[] = [];
@@ -252,7 +256,9 @@ function fetchPack(repo: Repository, commands: string[]): Buffer {
     out.push(...encodeSideband(1, pack));
     out.push(Buffer.from('0000', 'ascii'));
   }
-  return Buffer.concat(out);
+  const response = Buffer.concat(out);
+  if (shallowCloneKey !== '') depthOneResponseCache.set(shallowCloneKey, response);
+  return response;
 }
 
 function parseServiceRequest(bytes: Buffer): string[] { return parseCommands(bytes); }

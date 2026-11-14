@@ -37,7 +37,7 @@ export function createApp(): Server {
   return createServer(async (req, res) => {
     const requestId = store.requestHeader();
     let url: URL;
-    try { url = new URL(req.url ?? '/', 'http://entry'); }
+    try { url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'entry'}`); }
     catch { jsonError(res, 400, 'Invalid URL', requestId); return; }
 
     if (req.method === 'GET' && url.pathname === '/healthz') {

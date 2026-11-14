@@ -18,6 +18,7 @@ export interface Repository {
   labels: Map<string, Label>;
   comments: Map<number, Comment>;
   refs: Map<string, string>;
+  refsVersion: number;
   cache: Map<string, Buffer>;
   nextIssueNumber: number;
   nextPullNumber: number;
@@ -85,7 +86,7 @@ export class ForgeStore {
       id, node_id: globalId('Repository', id), owner, name, full_name: `${owner}/${name}`,
       description, private: isPrivate, default_branch: 'main', created_at: FIXED_TIME,
       updated_at: FIXED_TIME, issues: new Map(), pulls: new Map(), labels: new Map(),
-      comments: new Map(), refs: new Map(), cache: new Map(), nextIssueNumber: 1, nextPullNumber: 1,
+      comments: new Map(), refs: new Map(), refsVersion: 0, cache: new Map(), nextIssueNumber: 1, nextPullNumber: 1,
     };
     this.repositories.set(key, repo);
     return repo;

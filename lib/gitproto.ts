@@ -5,7 +5,9 @@ import { buildPack, decodePktLines, depthObjects, encodePktLine, encodePktLines,
 const depthOneCache = new Map<string, Buffer>();
 const depthOneResponseCache = new Map<string, Buffer>();
 const fetchResponseCache = new Map<string, Buffer>();
+const lsRefsResponseCache = new Map<string, Buffer>();
 const caps = ['report-status', 'side-band-64k', 'delete-refs', 'ofs-delta', 'agent=makefun-forge/1.0', 'object-format=sha1'];
+const V2_ADVERTISEMENT = encodePktLines(['version 2\n', 'agent=makefun-forge/1.0\n', 'ls-refs=unborn\n', 'fetch=shallow wait-for-done\n', 'object-format=sha1\n', 'flush']);
 type Cmd = { old: string; next: string; ref: string };
 
 function write(res: ServerResponse, status: number, contentType: string, bytes: Buffer): void {
@@ -63,10 +65,6 @@ function v0Advertisement(repo: Repository, service: string): Buffer {
   }
   lines.push('flush');
   return encodePktLines(lines);
-}
-
-function v2Advertisement(): Buffer {
-  return encodePktLines(['version 2\n', 'agent=makefun-forge/1.0\n', 'ls-refs=unborn\n', 'fetch=shallow wait-for-done\n', 'object-format=sha1\n', 'flush']);
 }
 
 function parseCommands(bytes: Buffer): string[] {
@@ -144,18 +142,21 @@ function receivePack(repo: Repository, bytes: Buffer): Buffer {
     return Buffer.concat(encodeSideband(1, encodePktLines([`unpack ${detail}\n`, ...commands.map((cmd) => `ng ${cmd.ref} unpacker error\n`), 'flush'])));
   }
   const report: Array<string | Buffer | 'flush'> = ['unpack ok\n'];
+  let refsChanged = false;
   for (const command of commands) {
     const current = repo.refs.get(command.ref) ?? ZERO_OID;
     if (current !== command.old) { report.push(`ng ${command.ref} stale info\n`); continue; }
-    if (command.next === ZERO_OID) { repo.refs.delete(command.ref); report.push(`ok ${command.ref}\n`); continue; }
+    if (command.next === ZERO_OID) { refsChanged = repo.refs.delete(command.ref) || refsChanged; report.push(`ok ${command.ref}\n`); continue; }
     if (!lookupObject(store, command.next)) { report.push(`ng ${command.ref} missing object\n`); continue; }
     if (command.ref.startsWith('refs/heads/') && !isAncestor(current, command.next)) {
       report.push(`ng ${command.ref} non-fast-forward\n`); continue;
     }
+    if (current !== command.next) refsChanged = true;
     repo.refs.set(command.ref, command.next);
     report.push(`ok ${command.ref}\n`);
   }
   report.push('flush');
+  if (refsChanged) repo.refsVersion += 1;
   return Buffer.concat(encodeSideband(1, encodePktLines(report)));
 }
 
@@ -271,29 +272,37 @@ export function isGitRoute(pathname: string): boolean {
   return /^\/[^/]+\/[^/]+(?:\.git)?\/(?:info\/refs|git-upload-pack|git-receive-pack)$/.test(pathname);
 }
 
-export async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL, body: Buffer): Promise<boolean> {
-  const match = /^\/([^/]+)\/([^/]+)\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(url.pathname);
+export async function handleGit(req: IncomingMessage, res: ServerResponse, pathname: string, rawQuery: string, body: Buffer): Promise<boolean> {
+  const match = /^\/([^/]+)\/([^/]+)\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(pathname);
   if (!match) return false;
   const [, owner, rawRepoName, endpoint] = match as [string, string, string, string];
   const repoName = rawRepoName.endsWith('.git') ? rawRepoName.slice(0, -4) : rawRepoName;
   const repo = store.repository(decodeURIComponent(owner), decodeURIComponent(repoName));
   if (!repo) { write(res, 404, 'text/plain; charset=utf-8', Buffer.from('Repository not found\n')); return true; }
   if (endpoint === 'info/refs' && req.method === 'GET') {
-    const service = url.searchParams.get('service');
-    if (service === 'git-upload-pack') write(res, 200, 'application/x-git-upload-pack-advertisement', v2Advertisement());
+    const service = new URLSearchParams(rawQuery).get('service');
+    if (service === 'git-upload-pack') write(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT);
     else if (service === 'git-receive-pack') write(res, 200, 'application/x-git-receive-pack-advertisement', v0Advertisement(repo, service));
     else write(res, 400, 'text/plain; charset=utf-8', Buffer.from('Unknown git service\n'));
     return true;
   }
   if (endpoint === 'git-upload-pack' && req.method === 'POST') {
     try {
+      const isLsRefs = body.includes(Buffer.from('command=ls-refs'));
+      const lsRefsKey = isLsRefs ? `${repo.id}:${repo.refsVersion}:${body.toString('latin1')}` : '';
+      const cachedLsRefs = lsRefsKey === '' ? undefined : lsRefsResponseCache.get(lsRefsKey);
+      if (cachedLsRefs) { write(res, 200, 'application/x-git-upload-pack-result', cachedLsRefs); return true; }
       const isFetch = body.includes(Buffer.from('command=fetch'));
       const fetchKey = isFetch ? `${repo.id}:${body.toString('latin1')}` : '';
       const cached = fetchKey === '' ? undefined : fetchResponseCache.get(fetchKey);
       if (cached) { write(res, 200, 'application/x-git-upload-pack-result', cached); return true; }
       const commands = parseServiceRequest(body);
       const command = commands.find((line) => line.startsWith('command='))?.slice(8);
-      if (command === 'ls-refs') write(res, 200, 'application/x-git-upload-pack-result', lsRefs(repo, commands));
+      if (command === 'ls-refs') {
+        const response = lsRefs(repo, commands);
+        if (lsRefsKey !== '') lsRefsResponseCache.set(lsRefsKey, response);
+        write(res, 200, 'application/x-git-upload-pack-result', response);
+      }
       else if (command === 'fetch') {
         const response = fetchPack(repo, commands);
         if (fetchKey !== '') fetchResponseCache.set(fetchKey, response);

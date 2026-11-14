@@ -63,6 +63,7 @@ export function handleRest(req: IncomingMessage,res: ServerResponse,url: URL,byt
   if (!url.pathname.startsWith('/api/v3/')) return false;
   const method=req.method??'GET', path=url.pathname.slice('/api/v3/'.length).split('/').map(decodeURIComponent), body=():Body=>rec(bytes.length?JSON.parse(bytes.toString('utf8')):{});
   try {
+    if (method==='GET' && path[0]==='user' && path.length===1) { json(res,200,{login:viewer,id:1000,node_id:Buffer.from('User:1000').toString('base64')},requestId); return true; }
     if (method==='GET' && path[0]==='meta') { json(res,200,{installed_version:'3.0.0'},requestId); return true; }
     if (path[0]==='user'&&path[1]==='repos') {
       if(method==='POST') { const b=body(); if(typeof b.name!=='string'||!b.name) return (fail(res,422,'Repository name is required',requestId),true); const r=store.createRepository(viewer,b.name,String(b.description??''),b.private===true); json(res,201,pubRepo(r),requestId); return true; }

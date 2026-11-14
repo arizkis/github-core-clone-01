@@ -3,6 +3,7 @@ import { handleMcp } from './lib/mcp.ts';
 import { handleGit, isGitRoute } from './lib/gitproto.ts';
 import { handleRest } from './lib/rest.ts';
 import { handleGraphql } from './lib/graphql.ts';
+import { tokenIsAuthorized, viewerLogin } from './lib/scenario.ts';
 import { store } from './lib/store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
@@ -26,15 +27,7 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
   return Buffer.concat(chunks, length);
 }
 
-function authorized(req: IncomingMessage): boolean {
-  return /^Bearer\s+\S+$/i.test(String(req.headers.authorization ?? ''));
-}
-
-function login(req: IncomingMessage): string {
-  if (process.env.MAKEFUN_SHOP_LOGIN) return process.env.MAKEFUN_SHOP_LOGIN;
-  const token = String(req.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
-  return /^[a-z0-9-]+$/i.test(token) ? token : 'octocat';
-}
+function authorized(req: IncomingMessage): boolean { return tokenIsAuthorized(String(req.headers.authorization ?? '')); }
 
 function jsonError(res: ServerResponse, status: number, message: string, requestId: string): void {
   send(res, status, { message }, requestId);
@@ -59,6 +52,7 @@ export function createApp(): Server {
 
     // Git smart HTTP owns its explicit .git routes, before the JSON API dispatcher.
     if (isGitRoute(url.pathname)) {
+      if (!authorized(req)) { jsonError(res, 401, 'Bad credentials', requestId); return; }
       let bytes = Buffer.alloc(0);
       if (req.method === 'POST') {
         try { bytes = await readBody(req); }
@@ -85,7 +79,7 @@ export function createApp(): Server {
         try { JSON.parse(bytes.toString('utf8')); }
         catch { jsonError(res, 400, 'Invalid JSON body', requestId); return; }
       }
-      handleGraphql(res, bytes, requestId, login(req));
+      handleGraphql(res, bytes, requestId, viewerLogin);
       return;
     }
 
@@ -100,7 +94,7 @@ export function createApp(): Server {
           catch { jsonError(res, 400, 'Invalid JSON body', requestId); return; }
         }
       }
-      if (handleRest(req, res, url, bytes, requestId, login(req))) return;
+      if (handleRest(req, res, url, bytes, requestId, viewerLogin)) return;
     }
     jsonError(res, 404, 'Not Found', requestId);
   });

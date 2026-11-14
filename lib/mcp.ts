@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { store, type PullRequest, type Repository } from './store.ts';
+import { viewerLogin } from './scenario.ts';
 
 const REVISION = '2026-07-28';
 const LEGACY = '2025-11-25';
@@ -39,10 +40,8 @@ function content(value: unknown, isError = false): JsonObject {
 }
 
 function ownerFrom(req: IncomingMessage): string {
-  const envLogin = process.env.MAKEFUN_SHOP_LOGIN;
-  if (envLogin) return envLogin;
-  const bearer = String(req.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
-  return bearer && /^[a-z0-9-]+$/i.test(bearer) ? bearer : 'octocat';
+  void req;
+  return viewerLogin;
 }
 
 function repoFrom(args: JsonObject): Repository | undefined {

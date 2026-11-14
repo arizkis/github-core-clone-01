@@ -261,13 +261,14 @@ export function cacheDepthOnePack(repo: Repository, tip: string): Buffer { retur
 export function cachedDepthOnePackCount(): number { return depthOneCache.size; }
 
 export function isGitRoute(pathname: string): boolean {
-  return /^\/[^/]+\/[^/]+\.git\/(?:info\/refs|git-upload-pack|git-receive-pack)$/.test(pathname);
+  return /^\/[^/]+\/[^/]+(?:\.git)?\/(?:info\/refs|git-upload-pack|git-receive-pack)$/.test(pathname);
 }
 
 export async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL, body: Buffer): Promise<boolean> {
-  const match = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(url.pathname);
+  const match = /^\/([^/]+)\/([^/]+)\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(url.pathname);
   if (!match) return false;
-  const [, owner, repoName, endpoint] = match as [string, string, string, string];
+  const [, owner, rawRepoName, endpoint] = match as [string, string, string, string];
+  const repoName = rawRepoName.endsWith('.git') ? rawRepoName.slice(0, -4) : rawRepoName;
   const repo = store.repository(decodeURIComponent(owner), decodeURIComponent(repoName));
   if (!repo) { write(res, 404, 'text/plain; charset=utf-8', Buffer.from('Repository not found\n')); return true; }
   if (endpoint === 'info/refs' && req.method === 'GET') {

@@ -10,7 +10,7 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 type JsonRecord = Record<string, unknown>;
 
 function send(res: ServerResponse, status: number, body: unknown, requestId: string, headers: Record<string, string> = {}): void {
-  const bytes = Buffer.from(`${JSON.stringify(body)}\n`);
+  const bytes = Buffer.isBuffer(body) ? body : Buffer.from(`${JSON.stringify(body)}\n`);
   res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': bytes.length, 'x-github-request-id': requestId, ...headers });
   res.end(bytes);
 }
@@ -36,6 +36,13 @@ function jsonError(res: ServerResponse, status: number, message: string, request
 export function createApp(): Server {
   return createServer(async (req, res) => {
     const requestId = store.requestHeader();
+    const rawPath = req.url ?? '/';
+    const hotIssue = req.method === 'GET' ? /^\/api\/v3\/repos\/([^/?]+)\/([^/?]+)\/issues\/(\d+)$/.exec(rawPath) : null;
+    if (hotIssue && authorized(req)) {
+      const repo = store.repository(decodeURIComponent(hotIssue[1]!), decodeURIComponent(hotIssue[2]!));
+      const cached = repo?.owner === viewerLogin ? repo.cache.get(`issue:${hotIssue[3]}`) : undefined;
+      if (cached) { send(res, 200, cached, requestId); return; }
+    }
     let url: URL;
     try { url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'entry'}`); }
     catch { jsonError(res, 400, 'Invalid URL', requestId); return; }
@@ -89,10 +96,6 @@ export function createApp(): Server {
       if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method ?? '')) {
         try { bytes = await readBody(req); }
         catch { jsonError(res, 413, 'Request body too large', requestId); return; }
-        if (bytes.length && (req.headers['content-type'] ?? '').includes('json')) {
-          try { JSON.parse(bytes.toString('utf8')); }
-          catch { jsonError(res, 400, 'Invalid JSON body', requestId); return; }
-        }
       }
       if (handleRest(req, res, url, bytes, requestId, viewerLogin)) return;
     }

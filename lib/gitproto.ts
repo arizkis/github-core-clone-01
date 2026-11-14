@@ -4,6 +4,7 @@ import { buildPack, decodePktLines, depthObjects, encodePktLine, encodePktLines,
 
 const depthOneCache = new Map<string, Buffer>();
 const depthOneResponseCache = new Map<string, Buffer>();
+const fetchResponseCache = new Map<string, Buffer>();
 const caps = ['report-status', 'side-band-64k', 'delete-refs', 'ofs-delta', 'agent=makefun-forge/1.0', 'object-format=sha1'];
 type Cmd = { old: string; next: string; ref: string };
 
@@ -286,10 +287,18 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
   }
   if (endpoint === 'git-upload-pack' && req.method === 'POST') {
     try {
+      const isFetch = body.includes(Buffer.from('command=fetch'));
+      const fetchKey = isFetch ? `${repo.id}:${body.toString('latin1')}` : '';
+      const cached = fetchKey === '' ? undefined : fetchResponseCache.get(fetchKey);
+      if (cached) { write(res, 200, 'application/x-git-upload-pack-result', cached); return true; }
       const commands = parseServiceRequest(body);
       const command = commands.find((line) => line.startsWith('command='))?.slice(8);
       if (command === 'ls-refs') write(res, 200, 'application/x-git-upload-pack-result', lsRefs(repo, commands));
-      else if (command === 'fetch') write(res, 200, 'application/x-git-upload-pack-result', fetchPack(repo, commands));
+      else if (command === 'fetch') {
+        const response = fetchPack(repo, commands);
+        if (fetchKey !== '') fetchResponseCache.set(fetchKey, response);
+        write(res, 200, 'application/x-git-upload-pack-result', response);
+      }
       else write(res, 400, 'text/plain; charset=utf-8', Buffer.from('Unsupported upload-pack command\n'));
     } catch (cause) {
       write(res, 400, 'text/plain; charset=utf-8', Buffer.from(`${cause instanceof Error ? cause.message : String(cause)}\n`));

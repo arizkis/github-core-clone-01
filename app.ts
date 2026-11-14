@@ -1,0 +1,107 @@
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { handleMcp } from './lib/mcp.ts';
+import { handleGit, isGitRoute } from './lib/gitproto.ts';
+import { handleRest } from './lib/rest.ts';
+import { handleGraphql } from './lib/graphql.ts';
+import { store } from './lib/store.ts';
+
+const JSON_TYPE = 'application/json; charset=utf-8';
+type JsonRecord = Record<string, unknown>;
+
+function send(res: ServerResponse, status: number, body: unknown, requestId: string, headers: Record<string, string> = {}): void {
+  const bytes = Buffer.from(`${JSON.stringify(body)}\n`);
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': bytes.length, 'x-github-request-id': requestId, ...headers });
+  res.end(bytes);
+}
+
+async function readBody(req: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let length = 0;
+  for await (const chunk of req) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    length += bytes.length;
+    if (length > 2_000_000) throw new Error('Request body too large');
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks, length);
+}
+
+function authorized(req: IncomingMessage): boolean {
+  return /^Bearer\s+\S+$/i.test(String(req.headers.authorization ?? ''));
+}
+
+function login(req: IncomingMessage): string {
+  if (process.env.MAKEFUN_SHOP_LOGIN) return process.env.MAKEFUN_SHOP_LOGIN;
+  const token = String(req.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
+  return /^[a-z0-9-]+$/i.test(token) ? token : 'octocat';
+}
+
+function jsonError(res: ServerResponse, status: number, message: string, requestId: string): void {
+  send(res, status, { message }, requestId);
+}
+
+export function createApp(): Server {
+  return createServer(async (req, res) => {
+    const requestId = store.requestHeader();
+    let url: URL;
+    try { url = new URL(req.url ?? '/', 'http://entry'); }
+    catch { jsonError(res, 400, 'Invalid URL', requestId); return; }
+
+    if (req.method === 'GET' && url.pathname === '/healthz') {
+      send(res, 200, { ok: true }, requestId);
+      return;
+    }
+    if (req.method === 'GET' && (url.pathname === '/api/v3' || url.pathname === '/api/v3/')) {
+      if (!authorized(req)) { jsonError(res, 401, 'Bad credentials', requestId); return; }
+      send(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, requestId, { 'x-oauth-scopes': 'repo, read:org' });
+      return;
+    }
+
+    // Git smart HTTP owns its explicit .git routes, before the JSON API dispatcher.
+    if (isGitRoute(url.pathname)) {
+      let bytes = Buffer.alloc(0);
+      if (req.method === 'POST') {
+        try { bytes = await readBody(req); }
+        catch { jsonError(res, 413, 'Request body too large', requestId); return; }
+      }
+      await handleGit(req, res, url, bytes);
+      return;
+    }
+
+    if (url.pathname === '/mcp' && req.method === 'POST') {
+      let bytes: Buffer;
+      try { bytes = await readBody(req); }
+      catch { jsonError(res, 400, 'Request body too large', requestId); return; }
+      await handleMcp(req, res, bytes, authorized(req));
+      return;
+    }
+
+    if (url.pathname === '/api/graphql' && req.method === 'POST') {
+      if (!authorized(req)) { jsonError(res, 401, 'Bad credentials', requestId); return; }
+      let bytes: Buffer;
+      try { bytes = await readBody(req); }
+      catch { jsonError(res, 413, 'Request body too large', requestId); return; }
+      if ((req.headers['content-type'] ?? '').includes('json')) {
+        try { JSON.parse(bytes.toString('utf8')); }
+        catch { jsonError(res, 400, 'Invalid JSON body', requestId); return; }
+      }
+      handleGraphql(res, bytes, requestId, login(req));
+      return;
+    }
+
+    if (url.pathname.startsWith('/api/')) {
+      if (!authorized(req)) { jsonError(res, 401, 'Bad credentials', requestId); return; }
+      let bytes = Buffer.alloc(0);
+      if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method ?? '')) {
+        try { bytes = await readBody(req); }
+        catch { jsonError(res, 413, 'Request body too large', requestId); return; }
+        if (bytes.length && (req.headers['content-type'] ?? '').includes('json')) {
+          try { JSON.parse(bytes.toString('utf8')); }
+          catch { jsonError(res, 400, 'Invalid JSON body', requestId); return; }
+        }
+      }
+      if (handleRest(req, res, url, bytes, requestId, login(req))) return;
+    }
+    jsonError(res, 404, 'Not Found', requestId);
+  });
+}

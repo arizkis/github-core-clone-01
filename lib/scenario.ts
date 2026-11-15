@@ -44,9 +44,19 @@ const generated = users();
 export const viewerLogin = generated[0]!;
 export const strangerLogin = generated[2]!;
 
+let lastTokenHeader: string | undefined;
+let lastTokenVerdict = false;
+
 export function tokenIsAuthorized(header: string | undefined): boolean {
-  const match = /^Bearer\s+(\S+)$/i.exec(header ?? '');
-  if (!match) return false;
-  const expected = process.env.MAKEFUN_SHOP_TOKEN;
-  return !expected || match[1] === expected;
+  const value = header ?? '';
+  if (value === lastTokenHeader) return lastTokenVerdict;
+  const match = /^Bearer\s+(\S+)$/i.exec(value);
+  let verdict = false;
+  if (match) {
+    const expected = process.env.MAKEFUN_SHOP_TOKEN;
+    verdict = !expected || match[1] === expected;
+  }
+  lastTokenHeader = value;
+  lastTokenVerdict = verdict;
+  return verdict;
 }

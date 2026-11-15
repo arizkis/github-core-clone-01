@@ -1,4 +1,4 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ForgeRequest, ForgeResponse } from './server.ts';
 import { store, type PullRequest, type Repository } from './store.ts';
 import { viewerLogin } from './scenario.ts';
 
@@ -21,7 +21,7 @@ function isObject(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function reply(res: ServerResponse, status: number, bytes: Buffer): void {
+function reply(res: ForgeResponse, status: number, bytes: Buffer): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': bytes.length });
   res.end(bytes);
 }
@@ -39,7 +39,7 @@ function content(value: unknown, isError = false): JsonObject {
   return { content: [{ type: 'text', text }], structuredContent: value, ...(isError ? { isError: true } : {}) };
 }
 
-function ownerFrom(req: IncomingMessage): string {
+function ownerFrom(req: ForgeRequest): string {
   void req;
   return viewerLogin;
 }
@@ -57,7 +57,7 @@ function requiredArgs(toolName: string, args: JsonObject): string[] {
   return (found.inputSchema.required as string[]).filter((name) => args[name] === undefined || args[name] === null || args[name] === '');
 }
 
-function callTool(name: string, args: JsonObject, req: IncomingMessage): { value: unknown; error?: boolean } {
+function callTool(name: string, args: JsonObject, req: ForgeRequest): { value: unknown; error?: boolean } {
   const missing = requiredArgs(name, args);
   if (missing.length) return { value: { message: `Missing required arguments: ${missing.join(', ')}` }, error: true };
   if (name === 'create_repo') {
@@ -104,7 +104,7 @@ export function publicPull(pull: PullRequest): JsonObject {
   return { id: pull.id, node_id: pull.node_id, number: pull.number, title: pull.title, body: pull.body, state: pull.state, merged: pull.merged, head: { ref: pull.head.ref, sha: pull.head.sha }, base: { ref: pull.base.ref, sha: pull.base.sha }, created_at: pull.created_at, updated_at: pull.updated_at, merged_at: pull.merged_at };
 }
 
-export async function handleMcp(req: IncomingMessage, res: ServerResponse, body: Buffer, authorized: boolean): Promise<void> {
+export async function handleMcp(req: ForgeRequest, res: ForgeResponse, body: Buffer, authorized: boolean): Promise<void> {
   if (!authorized) {
     reply(res, 401, Buffer.from(JSON.stringify({ message: 'Bad credentials' })));
     return;

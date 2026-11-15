@@ -1,6 +1,6 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ForgeRequest, ForgeResponse } from './server.ts';
 import { store, type Repository } from './store.ts';
-import { buildPack, decodePktLines, depthObjects, encodePktLine, encodePktLines, encodeSideband, lookupObject, objectHash, parseCommit, ingestPack, parseTree, reachable, reachableDifference, ZERO_OID, type GitObject, type ObjectType } from './gitpack.ts';
+import { buildPack, decodePktLines, depthObjects, encodePktLine, encodePktLines, encodeSideband, lookupObject, objectHash, parseCommit, parsePack, parseTree, reachable, reachableDifference, ZERO_OID, type GitObject, type ObjectType } from './gitpack.ts';
 
 const depthOneCache = new Map<string, Buffer>();
 const depthOneResponseCache = new Map<string, Buffer>();
@@ -8,11 +8,16 @@ const fetchResponseCache = new Map<string, Buffer>();
 const fetchResponseInFlight = new Map<string, Promise<Buffer>>();
 const lsRefsResponseCache = new Map<string, Buffer>();
 const reportResponseCache = new Map<string, Buffer>();
+const v0AdvertisementCache = new Map<string, AdvertisementTemplate>();
 const caps = ['report-status', 'side-band-64k', 'delete-refs', 'ofs-delta', 'agent=makefun-forge/1.0', 'object-format=sha1'];
 const V2_ADVERTISEMENT = encodePktLines(['version 2\n', 'agent=makefun-forge/1.0\n', 'ls-refs=unborn\n', 'fetch=shallow wait-for-done\n', 'object-format=sha1\n', 'flush']);
+const LS_REFS_COMMAND = Buffer.from('command=ls-refs');
+const ADVERTISEMENT_OID = /^[0-9a-fA-F]{40}$/;
 type Cmd = { old: string; next: string; ref: string };
+type AdvertisementRow = { oid: string; name: string };
+type AdvertisementTemplate = { bytes: Buffer; oidOffsets: number[] };
 
-function write(res: ServerResponse, status: number, contentType: string, bytes: Buffer): void {
+function write(res: ForgeResponse, status: number, contentType: string, bytes: Buffer): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': bytes.length, 'cache-control': 'no-cache' });
   res.end(bytes);
 }
@@ -57,27 +62,58 @@ function peeled(hash: string): string | undefined {
   return undefined;
 }
 
-function v0Advertisement(repo: Repository, service: string): Buffer {
-  const lines: Array<string | Buffer | 'flush'> = [`# service=${service}\n`, 'flush'];
-  const all: Array<{ oid: string; name: string }> = [];
-  const head = defaultHead(repo);
-  all.push({ oid: head.oid, name: 'HEAD' });
-  for (const [name, oid] of branches(repo)) all.push({ oid, name });
-  if (all.length === 0) {
-    lines.push(`${ZERO_OID} capabilities^{}\0${caps.join(' ')} symref=HEAD:${head.ref}\n`);
-  } else {
-    for (let index = 0; index < all.length; index += 1) {
-      const ref = all[index]!;
-      const capabilities = index === 0 ? `\0${caps.join(' ')} symref=HEAD:${head.ref}` : '';
-      lines.push(`${ref.oid} ${ref.name}${capabilities}\n`);
-      if (ref.name.startsWith('refs/tags/')) {
-        const target = peeled(ref.oid);
-        if (target) lines.push(`${target} ${ref.name}^{}\n`);
-      }
+function advertisementRows(repo: Repository): AdvertisementRow[] {
+  const rows: AdvertisementRow[] = [{ oid: defaultHead(repo).oid, name: 'HEAD' }];
+  for (const [name, oid] of branches(repo)) {
+    rows.push({ oid, name });
+    if (name.startsWith('refs/tags/')) {
+      const target = peeled(oid);
+      if (target) rows.push({ oid: target, name: `${name}^{}` });
     }
   }
-  lines.push('flush');
-  return encodePktLines(lines);
+  return rows;
+}
+
+function buildV0Advertisement(rows: AdvertisementRow[], service: string, headRef: string): AdvertisementTemplate {
+  const packets = [encodePktLines([`# service=${service}\n`, 'flush'])];
+  const oidOffsets: number[] = [];
+  let offset = packets[0]!.length;
+  if (rows.length === 0) {
+    packets.push(encodePktLine(`${ZERO_OID} capabilities^{}\0${caps.join(' ')} symref=HEAD:${headRef}\n`));
+  } else {
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index]!;
+      const capabilities = index === 0 ? `\0${caps.join(' ')} symref=HEAD:${headRef}` : '';
+      const packet = encodePktLine(`${row.oid} ${row.name}${capabilities}\n`);
+      oidOffsets.push(offset + 4);
+      packets.push(packet);
+      offset += packet.length;
+    }
+  }
+  packets.push(Buffer.from('0000', 'ascii'));
+  return { bytes: Buffer.concat(packets), oidOffsets };
+}
+
+function v0Advertisement(repo: Repository, service: string): Buffer {
+  const rows = advertisementRows(repo);
+  const headRef = `refs/heads/${repo.default_branch}`;
+  // Fixed-width ASCII OIDs can be replaced without changing pkt-line lengths.
+  // Preserve the full encoding path for any rows that cannot use those slots.
+  if (rows.length === 0 || rows.some(({ oid }) => oid.length !== 40 || !ADVERTISEMENT_OID.test(oid))) {
+    return buildV0Advertisement(rows, service, headRef).bytes;
+  }
+  const key = JSON.stringify([repo.id, service, repo.default_branch, rows.map(({ name }) => name)]);
+  const cached = v0AdvertisementCache.get(key);
+  if (cached) {
+    const bytes = Buffer.from(cached.bytes);
+    for (let index = 0; index < rows.length; index += 1) {
+      bytes.write(rows[index]!.oid, cached.oidOffsets[index]!, 40, 'latin1');
+    }
+    return bytes;
+  }
+  const template = buildV0Advertisement(rows, service, headRef);
+  v0AdvertisementCache.set(key, template);
+  return template.bytes;
 }
 
 function parseCommands(bytes: Buffer): string[] {
@@ -144,7 +180,7 @@ async function receivePack(repo: Repository, bytes: Buffer): Promise<Buffer> {
   const { commands, pack } = commandLines(bytes);
   try {
     if (pack.length) {
-      const objects = await ingestPack(pack);
+      const objects = parsePack(pack);
       for (const [hash, object] of objects) {
         if (!store.gitObjects.has(hash) || !store.gitObjectTypes.has(hash)) {
           store.gitObjects.set(hash, object.data);
@@ -310,15 +346,18 @@ export function isGitRoute(pathname: string): boolean {
   return /^\/[^/]+\/[^/]+(?:\.git)?\/(?:info\/refs|git-upload-pack|git-receive-pack)$/.test(pathname);
 }
 
-export async function handleGit(req: IncomingMessage, res: ServerResponse, pathname: string, rawQuery: string, body: Buffer): Promise<boolean> {
+function decodeSegment(segment: string): string { return segment.includes('%') ? decodeURIComponent(segment) : segment; }
+
+export async function handleGit(req: ForgeRequest, res: ForgeResponse, pathname: string, rawQuery: string, body: Buffer): Promise<boolean> {
   const match = /^\/([^/]+)\/([^/]+)\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(pathname);
   if (!match) return false;
   const [, owner, rawRepoName, endpoint] = match as [string, string, string, string];
   const repoName = rawRepoName.endsWith('.git') ? rawRepoName.slice(0, -4) : rawRepoName;
-  const repo = store.repository(decodeURIComponent(owner), decodeURIComponent(repoName));
+  const repo = store.repository(decodeSegment(owner), decodeSegment(repoName));
   if (!repo) { write(res, 404, 'text/plain; charset=utf-8', Buffer.from('Repository not found\n')); return true; }
   if (endpoint === 'info/refs' && req.method === 'GET') {
-    const service = new URLSearchParams(rawQuery).get('service');
+    const service = rawQuery.startsWith('service=') && !rawQuery.includes('&') && !rawQuery.includes('%') && !rawQuery.includes('+')
+      ? rawQuery.slice(8) : new URLSearchParams(rawQuery).get('service');
     if (service === 'git-upload-pack') write(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT);
     else if (service === 'git-receive-pack') write(res, 200, 'application/x-git-receive-pack-advertisement', v0Advertisement(repo, service));
     else write(res, 400, 'text/plain; charset=utf-8', Buffer.from('Unknown git service\n'));
@@ -326,7 +365,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, pathn
   }
   if (endpoint === 'git-upload-pack' && req.method === 'POST') {
     try {
-      const isLsRefs = body.includes(Buffer.from('command=ls-refs'));
+      const isLsRefs = body.includes(LS_REFS_COMMAND);
       const lsRefsKey = isLsRefs ? `${repo.id}:${repo.refsVersion}:${repo.default_branch}:${body.toString('latin1')}` : '';
       const cachedLsRefs = lsRefsKey === '' ? undefined : lsRefsResponseCache.get(lsRefsKey);
       if (cachedLsRefs) { write(res, 200, 'application/x-git-upload-pack-result', cachedLsRefs); return true; }

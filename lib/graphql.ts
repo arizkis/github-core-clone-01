@@ -1,4 +1,4 @@
-import type { ServerResponse } from 'node:http';
+import type { ForgeResponse } from './server.ts';
 import { store, refreshIssue, type Repository, type Issue, type PullRequest } from './store.ts';
 import { publicRepo } from './mcp.ts';
 import { mergePull, pullFiles, pullMergeable } from './rest.ts';
@@ -102,7 +102,7 @@ function project(value:unknown,fields:Field[],viewer:string,errors:unknown[]):un
   }return out;
 }
 function execute(document:string,variables:Record<string,unknown>,viewer:string):Record<string,unknown>{const fields=new Parser(tokenize(document),variables).document();let kind='query';if(/^\s*mutation\b/.test(document))kind='mutation';const root={__type:kind==='mutation'?'RootMutation':'RootQuery'};const errors:unknown[]=[];const data=project(root,fields,viewer,errors);return errors.length?{data,errors}:{data};}
-export function handleGraphql(res:ServerResponse,bytes:Buffer,requestId:string,viewer:string):void{
+export function handleGraphql(res:ForgeResponse,bytes:Buffer,requestId:string,viewer:string):void{
   let body:unknown;try{body=JSON.parse(bytes.toString('utf8'));}catch{res.writeHead(400,{'content-type':JSON_TYPE,'x-github-request-id':requestId});res.end(JSON.stringify({message:'Invalid JSON body'}));return;}
   try{const one=(entry:unknown)=>{const row=entry as Record<string,unknown>;if(typeof row?.query!=='string')return{errors:[{message:'A query document is required'}]};return execute(row.query,typeof row.variables==='object'&&row.variables!==null?row.variables as Record<string,unknown>:{},viewer);};const output=Array.isArray(body)?body.map(one):one(body);const data=Buffer.from(`${JSON.stringify(output)}\n`);res.writeHead(200,{'content-type':JSON_TYPE,'content-length':data.length,'x-github-request-id':requestId});res.end(data);}catch(cause){const data=Buffer.from(JSON.stringify({errors:[{message:cause instanceof Error?cause.message:'Invalid query'}]}));res.writeHead(200,{'content-type':JSON_TYPE,'content-length':data.length,'x-github-request-id':requestId});res.end(data);}
 }

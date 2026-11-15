@@ -1,15 +1,15 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ForgeRequest, ForgeResponse } from './server.ts';
 import { store, refreshIssue, type Repository, type Issue, type PullRequest, type Label } from './store.ts';
 import { objectHash, parseCommit, parseTree, type GitObject } from './gitpack.ts';
 
 type Body = Record<string, unknown>;
 const ZERO = '0'.repeat(40);
 const JSON_TYPE = 'application/json; charset=utf-8';
-function json(res: ServerResponse, status: number, value: unknown, requestId: string, headers: Record<string, string> = {}): void {
+function json(res: ForgeResponse, status: number, value: unknown, requestId: string, headers: Record<string, string> = {}): void {
   const bytes = Buffer.isBuffer(value) ? value : Buffer.from(`${JSON.stringify(value)}\n`);
   res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': bytes.length, 'x-github-request-id': requestId, ...headers }); res.end(bytes);
 }
-function fail(res: ServerResponse, status: number, message: string, id: string): void { json(res, status, { message }, id); }
+function fail(res: ForgeResponse, status: number, message: string, id: string): void { json(res, status, { message }, id); }
 function rec(value: unknown): Body { return value && typeof value === 'object' && !Array.isArray(value) ? value as Body : {}; }
 function idFor(type: string, id: number): string { return Buffer.from(`${type}:${id}`).toString('base64'); }
 function ref(repo: Repository, branch: string): string { return repo.refs.get(branch.startsWith('refs/') ? branch : `refs/heads/${branch}`) ?? ZERO; }
@@ -59,7 +59,26 @@ function pubPull(p: PullRequest): unknown { return { id:p.id,node_id:p.node_id,n
 function cache(repo: Repository,key: string,value: unknown): Buffer { return store.cached(repo,key,value); }
 function link(url: URL,page: number,per: number,total: number): Record<string,string> { if(page*per>=total)return{};const query=new URLSearchParams(url.searchParams);query.set('per_page',String(per));query.set('page',String(page+1));return{link:`<${url.origin}${url.pathname}?${query.toString()}>; rel="next"`}; }
 
-export function handleRest(req: IncomingMessage,res: ServerResponse,url: URL,bytes: Buffer,requestId: string,viewer: string): boolean {
+export function createIssueFast(res: ForgeResponse, ownerSegment: string, nameSegment: string, bytes: Buffer, requestId: string, viewer: string): void {
+  try {
+    const repo = store.repository(ownerSegment, nameSegment);
+    if (!repo || repo.owner !== viewer) { fail(res, 404, 'Not Found', requestId); return; }
+    const b = rec(bytes.length ? JSON.parse(bytes.toString('utf8')) : {});
+    const names = Array.isArray(b.labels) ? b.labels.map(String) : [];
+    const labels: Label[] = [];
+    for (const name of names) {
+      const label = repo.labels.get(name.toLowerCase());
+      if (!label) { fail(res, 422, `Label ${name} does not exist`, requestId); return; }
+      labels.push(label);
+    }
+    const issue = store.createIssue(repo, String(b.title ?? ''), String(b.body ?? ''), labels);
+    json(res, 201, issue.serializedResponse, requestId);
+  } catch (cause) {
+    fail(res, 400, cause instanceof Error ? cause.message : 'Invalid request', requestId);
+  }
+}
+
+export function handleRest(req: ForgeRequest,res: ForgeResponse,url: URL,bytes: Buffer,requestId: string,viewer: string): boolean {
   if (!url.pathname.startsWith('/api/v3/')) return false;
   const method=req.method??'GET', path=url.pathname.slice('/api/v3/'.length).split('/').map(decodeURIComponent), body=():Body=>rec(bytes.length?JSON.parse(bytes.toString('utf8')):{});
   try {

@@ -48,7 +48,7 @@ export function createApp(): Server {
     const hotIssue = req.method === 'GET' ? /^\/api\/v3\/repos\/([^/?]+)\/([^/?]+)\/issues\/(\d+)$/.exec(rawPath) : null;
     if (hotIssue && authorized(req)) {
       const repo = store.repository(decodeURIComponent(hotIssue[1]!), decodeURIComponent(hotIssue[2]!));
-      const cached = repo?.owner === viewerLogin ? repo.cache.get(`issue:${hotIssue[3]}`) : undefined;
+      const cached = repo?.owner === viewerLogin ? repo.issues.get(Number(hotIssue[3]))?.serialized : undefined;
       if (cached) { send(res, 200, cached, requestId); return; }
     }
     if (isGitRoute(rawPath)) {

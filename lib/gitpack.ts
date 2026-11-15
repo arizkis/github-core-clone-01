@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
+import { createInflate, deflateSync, inflateSync } from 'node:zlib';
 import type { ForgeStore } from './store.ts';
 
 export type ObjectType = 'commit' | 'tree' | 'blob' | 'tag';
-export interface GitObject { type: ObjectType; data: Buffer; }
+export interface GitObject { type: ObjectType; data: Buffer; packed?: Buffer; }
 export interface TreeEntry { mode: string; name: string; hash: string; }
 export interface CommitData { tree: string; parents: string[]; author: string; committer: string; message: string; }
 const TYPES: Record<ObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
@@ -50,7 +50,7 @@ export function parseCommit(bytes: Uint8Array): CommitData {
 export function lookupObject(store: ForgeStore, hash: string): GitObject | undefined {
   const data = store.gitObjects.get(hash);
   const type = store.gitObjectTypes.get(hash);
-  return data && type ? { type, data } : undefined;
+  return data && type ? { type, data, packed: store.gitPackedEntries.get(hash) } : undefined;
 }
 
 export function reachable(tips: Iterable<string>, lookup: (hash: string) => GitObject | undefined): Set<string> {
@@ -120,14 +120,21 @@ export function buildPack(objects: Iterable<GitObject>): Buffer {
   const head = Buffer.alloc(12);
   head.write('PACK', 0, 4, 'ascii'); head.writeUInt32BE(2, 4); head.writeUInt32BE(list.length, 8);
   const chunks: Buffer[] = [head];
+  const digest = createHash('sha1').update(head);
   for (const object of list) {
-    chunks.push(encodeEntryHeader(object.type, object.data.length), deflateSync(object.data));
+    const entry = object.packed ?? Buffer.concat([encodeEntryHeader(object.type, object.data.length), deflateSync(object.data)]);
+    chunks.push(entry); digest.update(entry);
   }
-  const body = Buffer.concat(chunks);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  chunks.push(digest.digest());
+  return Buffer.concat(chunks);
 }
 
-export function parsePack(packBytes: Uint8Array): Map<string, GitObject> {
+type Inflation = { buffer: Buffer; consumed: number; hash: string };
+type InflationRequest = { input: Buffer; type: ObjectType; size: number };
+const validatedEntries = new Map<string, Array<{ hash: string; object: GitObject }>>();
+function entryPrefix(bytes: Buffer): string { return bytes.subarray(0, 8).toString('latin1'); }
+
+function* packEntries(packBytes: Uint8Array): Generator<InflationRequest, Map<string, GitObject>, Inflation> {
   const pack = Buffer.from(packBytes.buffer, packBytes.byteOffset, packBytes.byteLength);
   if (pack.length < 32 || pack.toString('ascii', 0, 4) !== 'PACK') throw new Error('Invalid pack header');
   const version = pack.readUInt32BE(4);
@@ -140,6 +147,16 @@ export function parsePack(packBytes: Uint8Array): Map<string, GitObject> {
   let offset = 12;
   for (let index = 0; index < count; index += 1) {
     if (offset >= end) throw new Error('Truncated pack entry');
+    const entryStart = offset;
+    // A full byte match includes the entry header and the complete validated
+    // zlib stream. Prefixes only select candidates; they never establish identity.
+    const known = validatedEntries.get(entryPrefix(pack.subarray(offset, end)))?.find(({ object }) =>
+      object.packed!.length <= end - offset && pack.subarray(offset, offset + object.packed!.length).equals(object.packed!));
+    if (known) {
+      offset += known.object.packed!.length;
+      objects.set(known.hash, known.object);
+      continue;
+    }
     const first = pack[offset++]!;
     const code = (first >> 4) & 7;
     if (code === 6 || code === 7) throw new Error('Delta objects are unsupported');
@@ -151,15 +168,54 @@ export function parsePack(packBytes: Uint8Array): Map<string, GitObject> {
       byte = pack[offset++]!; size += (byte & 127) * 2 ** shift; shift += 7;
       if (shift > 56) throw new Error('Pack size overflow');
     }
-    const inflated = inflateSync(pack.subarray(offset, end), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
-    offset += inflated.engine.bytesWritten;
+    const inflated = yield { input: pack.subarray(offset, end), type, size };
+    offset += inflated.consumed;
     if (inflated.buffer.length !== size) throw new Error('Pack object length mismatch');
-    const data = Buffer.from(inflated.buffer);
-    const hash = objectHash(type, data);
-    objects.set(hash, { type, data });
+    const data = inflated.buffer;
+    const hash = inflated.hash;
+    // Retain exactly the validated entry.  A later pack only needs a new pack
+    // header/checksum, rather than another compression pass for this object.
+    objects.set(hash, { type, data, packed: Buffer.from(pack.subarray(entryStart, offset)) });
   }
   if (offset !== end) throw new Error('Unexpected bytes before pack checksum');
+  for (const [hash, object] of objects) {
+    const key = entryPrefix(object.packed!);
+    const bucket = validatedEntries.get(key) ?? [];
+    if (!bucket.some(entry => entry.object.packed!.equals(object.packed!))) bucket.push({ hash, object });
+    validatedEntries.set(key, bucket);
+  }
   return objects;
+}
+
+export function parsePack(packBytes: Uint8Array): Map<string, GitObject> {
+  const entries = packEntries(packBytes);
+  let step = entries.next();
+  while (!step.done) {
+    const { input, type } = step.value;
+    const inflated = inflateSync(input, { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    step = entries.next({ buffer: inflated.buffer, consumed: inflated.engine.bytesWritten, hash: objectHash(type, inflated.buffer) });
+  }
+  return step.value;
+}
+
+export async function ingestPack(packBytes: Uint8Array): Promise<Map<string, GitObject>> {
+  const entries = packEntries(packBytes);
+  let step = entries.next();
+  while (!step.done) {
+    const { input, type, size } = step.value;
+    const inflated = await new Promise<Inflation>((resolve, reject) => {
+      const inflater = createInflate();
+      const hash = createHash('sha1').update(`${type} ${size}\0`);
+      const chunks: Buffer[] = [];
+      let length = 0;
+      inflater.on('data', (chunk: Buffer) => { hash.update(chunk); chunks.push(chunk); length += chunk.length; });
+      inflater.once('error', reject);
+      inflater.once('end', () => resolve({ buffer: chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, length), consumed: inflater.bytesWritten, hash: hash.digest('hex') }));
+      inflater.end(input);
+    });
+    step = entries.next(inflated);
+  }
+  return step.value;
 }
 
 export function encodePktLine(payload: string | Uint8Array): Buffer {

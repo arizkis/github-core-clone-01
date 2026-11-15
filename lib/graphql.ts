@@ -1,5 +1,5 @@
 import type { ServerResponse } from 'node:http';
-import { store, type Repository, type Issue, type PullRequest } from './store.ts';
+import { store, refreshIssue, type Repository, type Issue, type PullRequest } from './store.ts';
 import { publicRepo } from './mcp.ts';
 import { mergePull, pullFiles, pullMergeable } from './rest.ts';
 
@@ -87,10 +87,10 @@ function cursorIndex(cursor:unknown):number{if(typeof cursor!=='string')return -
 function mutate(field:Field,viewer:string):unknown{
   const input=(field.args.input??{}) as Record<string,unknown>;
   if(field.name==='createIssue'){const repo=repoById(input.repositoryId);if(!repo)throw new Error('Repository not found');return{issue:issueView(store.createIssue(repo,String(input.title??''),String(input.body??''))) };}
-  if(field.name==='closeIssue'){const issue=issueById(input.issueId);if(!issue)throw new Error('Issue not found');issue.state='closed';store.invalidate(issue.repository,k=>k===`issue:${issue.number}`||k.startsWith('issues:'));return{issue:issueView(issue)};}
+  if(field.name==='closeIssue'){const issue=issueById(input.issueId);if(!issue)throw new Error('Issue not found');issue.state='closed';refreshIssue(issue);store.invalidate(issue.repository,k=>k===`issue:${issue.number}`||k.startsWith('issues:'));return{issue:issueView(issue)};}
   if(field.name==='createPullRequest'){const repo=repoById(input.repositoryId);if(!repo)throw new Error('Repository not found');const head=String(input.headRefName??''),base=String(input.baseRefName??repo.default_branch);const p=store.createPull(repo,String(input.title??''),String(input.body??''),head,base);p.mergeable=pullMergeable(p);return{pullRequest:pullView(p)};}
   if(field.name==='mergePullRequest'){const pull=pullById(input.pullRequestId);if(!pull)throw new Error('Pull request not found');const sha=mergePull(pull);if(!sha)throw new Error('Pull request is not mergeable');pull.state='closed';pull.merged=true;pull.merged_at='2025-01-01T00:00:00.000Z';pull.merge_commit_sha=sha;store.invalidate(pull.repository,k=>k===`pull:${pull.number}`||k.startsWith('pulls:')||k.startsWith('branches:'));return{pullRequest:pullView(pull)};}
-  if(field.name==='addComment'){const issue=issueById(input.subjectId);const pull=pullById(input.subjectId);if(!issue&&!pull)throw new Error('Comment subject not found');const repo=issue?.repository??pull!.repository;const comment={id:store.nextId++,body:String(input.body??''),created_at:'2025-01-01T00:00:00.000Z',...(issue?{issue_number:issue.number}:{pull_number:pull!.number})};repo.comments.set(comment.id,comment);if(issue){issue.comments++;store.invalidate(repo,k=>k===`issue:${issue.number}`||k.startsWith('issues:'));}return{commentEdge:{node:{id:Buffer.from(`Comment:${comment.id}`).toString('base64'),body:comment.body}}};}
+  if(field.name==='addComment'){const issue=issueById(input.subjectId);const pull=pullById(input.subjectId);if(!issue&&!pull)throw new Error('Comment subject not found');const repo=issue?.repository??pull!.repository;const comment={id:store.nextId++,body:String(input.body??''),created_at:'2025-01-01T00:00:00.000Z',...(issue?{issue_number:issue.number}:{pull_number:pull!.number})};repo.comments.set(comment.id,comment);if(issue){issue.comments++;refreshIssue(issue);store.invalidate(repo,k=>k===`issue:${issue.number}`||k.startsWith('issues:'));}return{commentEdge:{node:{id:Buffer.from(`Comment:${comment.id}`).toString('base64'),body:comment.body}}};}
   throw new Error(`Cannot query field "${field.name}" on type "Mutation".`);
 }
 const known:Record<string,string[]>={RootQuery:['viewer','repository','node','__type'],RootMutation:['createIssue','closeIssue','createPullRequest','mergePullRequest','addComment']};

@@ -36,6 +36,17 @@ export interface Issue {
   updated_at: string;
   comments: number;
   repository: Repository;
+  serialized: Buffer;
+  serializedResponse: Buffer;
+}
+
+const ISSUE_TIMES = `,"created_at":"${FIXED_TIME}","updated_at":"${FIXED_TIME}"}`;
+export function refreshIssue(issue: Issue): void {
+  const labels = issue.labels.length ? JSON.stringify(issue.labels.map(l => ({ id:l.id,name:l.name,color:l.color }))) : '[]';
+  const text = `{"id":${issue.id},"node_id":"${issue.node_id}","number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":"${issue.state}","labels":${labels},"comments":${issue.comments}` +
+    (issue.created_at === FIXED_TIME && issue.updated_at === FIXED_TIME ? ISSUE_TIMES : `,"created_at":${JSON.stringify(issue.created_at)},"updated_at":${JSON.stringify(issue.updated_at)}}`);
+  issue.serializedResponse = Buffer.from(text + '\n');
+  issue.serialized = issue.serializedResponse.subarray(0, issue.serializedResponse.length - 1);
 }
 
 export interface PullRequest {
@@ -65,6 +76,9 @@ export class ForgeStore {
   readonly repositories = new Map<string, Repository>();
   readonly gitObjects = new Map<string, Buffer>();
   readonly gitObjectTypes = new Map<string, 'commit' | 'tree' | 'blob' | 'tag'>();
+  // The validated on-wire entry (pack header plus deflated object body).  Objects
+  // received through receive-pack retain this so upload-pack can reuse it.
+  readonly gitPackedEntries = new Map<string, Buffer>();
   requestId = 0;
   nextId = 1;
 
@@ -92,15 +106,17 @@ export class ForgeStore {
     return repo;
   }
 
-  createIssue(repo: Repository, title: string, body = ''): Issue {
+  createIssue(repo: Repository, title: string, body = '', labels: Label[] = []): Issue {
     const id = this.nextId++;
     const issue: Issue = {
       id, node_id: globalId('Issue', id), number: repo.nextIssueNumber++,
-      title, body, state: 'open', labels: [], created_at: FIXED_TIME, updated_at: FIXED_TIME,
+      title, body, state: 'open', labels, created_at: FIXED_TIME, updated_at: FIXED_TIME,
       comments: 0, repository: repo,
+      serialized: undefined!, serializedResponse: undefined!,
     };
     repo.issues.set(issue.number, issue);
     this.invalidate(repo, (key) => key === `issue:${issue.number}` || key.startsWith('issues:'));
+    refreshIssue(issue);
     return issue;
   }
 

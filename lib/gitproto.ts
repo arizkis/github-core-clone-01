@@ -1,11 +1,13 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { store, type Repository } from './store.ts';
-import { buildPack, decodePktLines, depthObjects, encodePktLine, encodePktLines, encodeSideband, lookupObject, objectHash, parseCommit, parsePack, parseTree, reachable, reachableDifference, ZERO_OID, type GitObject, type ObjectType } from './gitpack.ts';
+import { buildPack, decodePktLines, depthObjects, encodePktLine, encodePktLines, encodeSideband, lookupObject, objectHash, parseCommit, ingestPack, parseTree, reachable, reachableDifference, ZERO_OID, type GitObject, type ObjectType } from './gitpack.ts';
 
 const depthOneCache = new Map<string, Buffer>();
 const depthOneResponseCache = new Map<string, Buffer>();
 const fetchResponseCache = new Map<string, Buffer>();
+const fetchResponseInFlight = new Map<string, Promise<Buffer>>();
 const lsRefsResponseCache = new Map<string, Buffer>();
+const reportResponseCache = new Map<string, Buffer>();
 const caps = ['report-status', 'side-band-64k', 'delete-refs', 'ofs-delta', 'agent=makefun-forge/1.0', 'object-format=sha1'];
 const V2_ADVERTISEMENT = encodePktLines(['version 2\n', 'agent=makefun-forge/1.0\n', 'ls-refs=unborn\n', 'fetch=shallow wait-for-done\n', 'object-format=sha1\n', 'flush']);
 type Cmd = { old: string; next: string; ref: string };
@@ -13,6 +15,17 @@ type Cmd = { old: string; next: string; ref: string };
 function write(res: ServerResponse, status: number, contentType: string, bytes: Buffer): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': bytes.length, 'cache-control': 'no-cache' });
   res.end(bytes);
+}
+
+function reportResponse(report: Array<string | Buffer | 'flush'>): Buffer {
+  // Successful receive-pack reports repeat verbatim in push-heavy workloads.
+  const key = report.join('\0');
+  let response = reportResponseCache.get(key);
+  if (!response) {
+    response = Buffer.concat(encodeSideband(1, encodePktLines(report)));
+    reportResponseCache.set(key, response);
+  }
+  return response;
 }
 
 function packetText(text: string): Buffer { return encodePktLine(`${text}\n`); }
@@ -127,14 +140,17 @@ function isAncestor(oldHash: string, nextHash: string): boolean {
   return false;
 }
 
-function receivePack(repo: Repository, bytes: Buffer): Buffer {
+async function receivePack(repo: Repository, bytes: Buffer): Promise<Buffer> {
   const { commands, pack } = commandLines(bytes);
   try {
     if (pack.length) {
-      const objects = parsePack(pack);
+      const objects = await ingestPack(pack);
       for (const [hash, object] of objects) {
-        store.gitObjects.set(hash, object.data);
-        store.gitObjectTypes.set(hash, object.type);
+        if (!store.gitObjects.has(hash) || !store.gitObjectTypes.has(hash)) {
+          store.gitObjects.set(hash, object.data);
+          store.gitObjectTypes.set(hash, object.type);
+        }
+        if (object.packed) store.gitPackedEntries.set(hash, object.packed);
       }
     }
   } catch (cause) {
@@ -157,7 +173,7 @@ function receivePack(repo: Repository, bytes: Buffer): Buffer {
   }
   report.push('flush');
   if (refsChanged) repo.refsVersion += 1;
-  return Buffer.concat(encodeSideband(1, encodePktLines(report)));
+  return reportResponse(report);
 }
 
 function shallowReachable(tips: string[], boundaries: Set<string>): Set<string> {
@@ -191,7 +207,7 @@ function commitTreeClosure(hash: string, withBlobs: boolean): string[] {
 function commitHashTree(hash: string): string { return parseCommit(lookupObject(store, hash)!.data).tree; }
 
 function depthOnePack(repo: Repository, tip: string): Buffer {
-  const key = `${repo.id}:${tip}:1`;
+  const key = `${repo.id}:${repo.refsVersion}:${tip}:1`;
   const cached = depthOneCache.get(key);
   if (cached) return cached;
   const unique = [...new Set(commitTreeClosure(tip, true))];
@@ -206,7 +222,9 @@ function fetchPack(repo: Repository, commands: string[]): Buffer {
   const oldShallow = new Set(commands.filter((line) => line.startsWith('shallow ')).map((line) => line.slice(8).trim()));
   const depthLine = commands.find((line) => line.startsWith('deepen '));
   const depth = depthLine ? Math.max(1, Number(depthLine.slice(7)) || 1) : 0;
-  const shallowCloneKey = depth === 1 && wants.length === 1 && haves.length === 0 ? `${repo.id}:${wants[0]}:1` : '';
+  // Preserve every command and its order, including shallow boundaries, filters,
+  // negotiation options and future extensions, in this inner response cache too.
+  const shallowCloneKey = depth === 1 && wants.length === 1 && haves.length === 0 ? JSON.stringify([repo.id, repo.refsVersion, commands]) : '';
   const cachedResponse = shallowCloneKey === '' ? undefined : depthOneResponseCache.get(shallowCloneKey);
   if (cachedResponse) return cachedResponse;
   let objects: string[] = [];
@@ -265,6 +283,26 @@ function fetchPack(repo: Repository, commands: string[]): Buffer {
 
 function parseServiceRequest(bytes: Buffer): string[] { return parseCommands(bytes); }
 
+function cachedFetchResponse(key: string, build: () => Buffer): Promise<Buffer> {
+  const cached = fetchResponseCache.get(key);
+  if (cached) return Promise.resolve(cached);
+  const existing = fetchResponseInFlight.get(key);
+  if (existing) return existing;
+  // Deferring the synchronous assembly by one microtask lets requests which
+  // arrive in the same event-loop turn share this one build.
+  const pending = Promise.resolve().then(() => {
+    const response = build();
+    fetchResponseCache.set(key, response);
+    return response;
+  });
+  fetchResponseInFlight.set(key, pending);
+  const clear = (): void => {
+    if (fetchResponseInFlight.get(key) === pending) fetchResponseInFlight.delete(key);
+  };
+  void pending.then(clear, clear);
+  return pending;
+}
+
 export function cacheDepthOnePack(repo: Repository, tip: string): Buffer { return depthOnePack(repo, tip); }
 export function cachedDepthOnePackCount(): number { return depthOneCache.size; }
 
@@ -289,13 +327,9 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, pathn
   if (endpoint === 'git-upload-pack' && req.method === 'POST') {
     try {
       const isLsRefs = body.includes(Buffer.from('command=ls-refs'));
-      const lsRefsKey = isLsRefs ? `${repo.id}:${repo.refsVersion}:${body.toString('latin1')}` : '';
+      const lsRefsKey = isLsRefs ? `${repo.id}:${repo.refsVersion}:${repo.default_branch}:${body.toString('latin1')}` : '';
       const cachedLsRefs = lsRefsKey === '' ? undefined : lsRefsResponseCache.get(lsRefsKey);
       if (cachedLsRefs) { write(res, 200, 'application/x-git-upload-pack-result', cachedLsRefs); return true; }
-      const isFetch = body.includes(Buffer.from('command=fetch'));
-      const fetchKey = isFetch ? `${repo.id}:${body.toString('latin1')}` : '';
-      const cached = fetchKey === '' ? undefined : fetchResponseCache.get(fetchKey);
-      if (cached) { write(res, 200, 'application/x-git-upload-pack-result', cached); return true; }
       const commands = parseServiceRequest(body);
       const command = commands.find((line) => line.startsWith('command='))?.slice(8);
       if (command === 'ls-refs') {
@@ -304,8 +338,8 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, pathn
         write(res, 200, 'application/x-git-upload-pack-result', response);
       }
       else if (command === 'fetch') {
-        const response = fetchPack(repo, commands);
-        if (fetchKey !== '') fetchResponseCache.set(fetchKey, response);
+        const fetchKey = `${repo.id}:${repo.refsVersion}:${body.toString('latin1')}`;
+        const response = await cachedFetchResponse(fetchKey, () => fetchPack(repo, commands));
         write(res, 200, 'application/x-git-upload-pack-result', response);
       }
       else write(res, 400, 'text/plain; charset=utf-8', Buffer.from('Unsupported upload-pack command\n'));
@@ -315,7 +349,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, pathn
     return true;
   }
   if (endpoint === 'git-receive-pack' && req.method === 'POST') {
-    try { write(res, 200, 'application/x-git-receive-pack-result', receivePack(repo, body)); }
+    try { write(res, 200, 'application/x-git-receive-pack-result', await receivePack(repo, body)); }
     catch (cause) { write(res, 400, 'text/plain; charset=utf-8', Buffer.from(`${cause instanceof Error ? cause.message : String(cause)}\n`)); }
     return true;
   }

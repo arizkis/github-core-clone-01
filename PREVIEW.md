@@ -1,4 +1,68 @@
-# Go forge preview — turns 1, 2, and 3
+# Go forge preview — turns 1, 2, 3, and 4
+
+## Turn 4 performance measurements
+
+The retained change is limited to creation of new issues. It serializes the
+ordered response directly into one owned buffer, shared by the cached JSON
+and newline-terminated response views. IDs, numbers, timestamps, label order,
+escaping, invalidation, and update/read serialization are unchanged. No push
+or clone code changes remain.
+
+`tests/perf_driver.ts` invokes the kit's exported benchmark with the exact
+workloads: 50 concurrent depth-1 clones of a 200-commit repository, or 200
+sequential authenticated issue creations per round. The diagnostic-only
+`perfprofile` build tag exposes CPU, allocation, mutex, and blocking profiles
+on a separate loopback listener selected with `FORGE_PPROF_ADDR`; it is excluded
+from the shipped binary. Profiles ran for 20 seconds per workload.
+
+Clone CPU samples were led by syscalls (30.0%), routing regex work, and request
+handling. Pack construction was already effectively eliminated by warm-ups.
+The global store lock covers construction, but aggregate measured store-lock
+wait was only 78.1 ms over the 20-second profile. Issue creation accounted for
+34.2% of sampled write allocations, including generic JSON objects and a second
+cached-body copy. After the retained serializer change, sampled allocation
+bytes per created issue decreased approximately 56% within CreateIssue and
+14% across the whole workload (normalized by completed batches).
+
+Two clone candidates were rejected and fully reverted:
+
+- Snapshot immutable git objects once per flight, release the store mutex for
+  construction and waiting, and bypass parsing on cached fetches: clone 37
+  versus baseline 39 points, so the extra snapshot/refactor was removed.
+- Cache validated upload routes, fully frame cached ls-refs responses, and
+  bypass packet parsing on fetch cache hits: paired warmed clone measurements
+  improved (baseline 47/47/49 versus candidate 50/50/50), but complete local
+  grades scored clone 38 and 36 versus baseline 39. Those changes were removed
+  because the workload points did not hold in the complete grader.
+
+Every local grader invocation used one process-driver instance through
+`node main.ts`. All had feature 600, agent 200, and identical canonical state
+SHA-256 `a0e98d49854b961230227867235c8615858e006db3763f341ac6154af1445590`.
+
+| Run | Score | Perf | Push | Clone | Read | Write |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Unchanged baseline | 985 | 185 | 50 | 39 | 50 | 46 |
+| Snapshot candidate (reverted) | 984 | 184 | 50 | 37 | 50 | 47 |
+| Smaller clone candidate (reverted) | 988 | 188 | 50 | 38 | 50 | 50 |
+| Smaller clone confirmation (reverted) | 982 | 182 | 50 | 36 | 50 | 46 |
+| Final write-only tuning | 983 | 183 | 49 | 34 | 50 | 50 |
+
+Baseline/final p50 milliseconds: push 351.596/424.257, clone 120.940/162.161,
+read 614.573/653.764, write 110.524/88.940. The final run improved write points;
+the complete perf score decreased due to slower measurements on unchanged
+paths. These are local advisory measurements, not a production ranking claim.
+The process driver is unisolated, and its Node 22 differs from the server's
+Node 26; the grader reports that mismatch. L1 replay reproduced on every run.
+
+Final validation before packaging: 390 REST/lifecycle checks, 247 git checks,
+195 GraphQL/MCP checks, and 4 launcher checks (836 total), all passing. The
+first three harnesses also passed against the race binary (832 checks), as
+did all five Go tests, race-enabled Go tests, and go vet. The existing real-git
+source limitations described below remain byte-identical. The stripped static
+binary is 7,450,784 bytes and executable mode 100755. No submission was made.
+
+Final packaging removes this preview document, `tests/`, and the diagnostic
+profile build file in a separate commit, while keeping ZLIB-NOTICE.txt.
 
 Turn 1 ports the deterministic scenario, shared store, HTTP transport, process
 lifecycle, and every REST route in `lib/rest.ts`. Turn 2 ports the checked-in
@@ -27,7 +91,7 @@ coordinator's `/register`, and polls `/done`. Its in-memory state starts empty.
 No competition submission is performed by the binary or the preview checks.
 
 The committed preview binary is a stripped, statically linked Linux amd64 ELF,
-7,446,688 bytes, built with Go 1.27.4 and `CGO_ENABLED=0`, committed as mode
+7,450,784 bytes, built with Go 1.27.4 and `CGO_ENABLED=0`, committed as mode
 `100755`. The launcher locates it relative to its own file, inherits environment
 and stdio, waits for the child, and returns its exit code. Spawn failure exits 1.
 

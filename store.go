@@ -155,7 +155,7 @@ func (s *ForgeStore) CreateIssue(r *Repository, title, body string, labels []*La
 	r.NextIssueNumber++
 	r.Issues.Set(i.Number, i)
 	s.Invalidate(r, func(k string) bool { return k == fmt.Sprintf("issue:%d", i.Number) || strings.HasPrefix(k, "issues:") })
-	refreshIssue(i)
+	serializeNewIssue(i)
 	return i
 }
 func (s *ForgeStore) CreatePull(r *Repository, title, body, head, base string) *PullRequest {
@@ -218,6 +218,33 @@ func refreshIssue(i *Issue) {
 	b := jsonBytes(publicIssue(i))
 	i.Serialized = b
 	i.SerializedResponse = append(bytes.Clone(b), '\n')
+}
+
+// New issues have fixed state, comment count, and timestamps. Build both cached
+// forms in one owned buffer; updates still replace them through refreshIssue.
+func serializeNewIssue(i *Issue) {
+	b := make([]byte, 0, 256+len(i.NodeID)+len(i.Title)+len(i.Body))
+	b = append(b, `{"id":`...)
+	b = strconv.AppendInt(b, int64(i.ID), 10)
+	b = append(b, `,"node_id":`...)
+	b = appendJSONString(b, i.NodeID)
+	b = append(b, `,"number":`...)
+	b = strconv.AppendInt(b, int64(i.Number), 10)
+	b = append(b, `,"title":`...)
+	b = appendJSONString(b, i.Title)
+	b = append(b, `,"body":`...)
+	b = appendJSONString(b, i.Body)
+	b = append(b, `,"state":"open","labels":[`...)
+	for index, label := range i.Labels {
+		if index != 0 {
+			b = append(b, ',')
+		}
+		b = appendJSON(b, label.Public())
+	}
+	b = append(b, `],"comments":0,"created_at":"`+fixedTime+`","updated_at":"`+fixedTime+`"}`...)
+	b = append(b, '\n')
+	i.SerializedResponse = b
+	i.Serialized = b[: len(b)-1 : len(b)-1]
 }
 func nullableString(p *string) any {
 	if p == nil {

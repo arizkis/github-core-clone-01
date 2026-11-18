@@ -27,6 +27,31 @@ type ForgeResponse struct {
 	Status  int
 	Headers []header
 	Body    []byte
+	Wire    *gitWireResponse
+}
+
+type gitWireResponse struct{ KeepAlive, Close []byte }
+
+func frameGitResponse(res *ForgeResponse) *ForgeResponse {
+	// Fetch bodies are already sideband framed. Cache the complete HTTP reply
+	// too, so every waiter writes the very same immutable buffer once.
+	var prefix []byte
+	prefix = append(prefix, "HTTP/1.1 200 OK\r\n"...)
+	for _, h := range res.Headers {
+		prefix = append(prefix, h.Name+": "+h.Value+"\r\n"...)
+	}
+	keep := make([]byte, 0, len(prefix)+2+len(res.Body))
+	keep = append(keep, prefix...)
+	keep = append(keep, '\r', '\n')
+	bodyAt := len(keep)
+	keep = append(keep, res.Body...)
+	closeWire := make([]byte, 0, len(prefix)+21+len(res.Body))
+	closeWire = append(closeWire, prefix...)
+	closeWire = append(closeWire, "Connection: close\r\n\r\n"...)
+	closeWire = append(closeWire, res.Body...)
+	res.Body = keep[bodyAt:]
+	res.Wire = &gitWireResponse{keep, closeWire}
+	return res
 }
 
 func sendJSON(status int, value any, requestID string, headers ...header) *ForgeResponse {
@@ -37,7 +62,7 @@ func sendJSON(status int, value any, requestID string, headers ...header) *Forge
 		data = append(jsonBytes(value), '\n')
 	}
 	h := []header{{"content-type", jsonType}, {"content-length", strconv.Itoa(len(data))}, {"x-github-request-id", requestID}}
-	return &ForgeResponse{status, append(h, headers...), data}
+	return &ForgeResponse{Status: status, Headers: append(h, headers...), Body: data}
 }
 func fail(status int, message, requestID string) *ForgeResponse {
 	return sendJSON(status, obj("message", message), requestID)
@@ -318,6 +343,14 @@ func serveConnection(c net.Conn) {
 var reasons = map[int]string{200: "OK", 201: "Created", 202: "Accepted", 204: "No Content", 304: "Not Modified", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 413: "Payload Too Large", 422: "Unprocessable Entity", 500: "Internal Server Error"}
 
 func writeResponse(c net.Conn, res *ForgeResponse, close, headOnly bool) error {
+	if res.Wire != nil && !headOnly {
+		wire := res.Wire.KeepAlive
+		if close {
+			wire = res.Wire.Close
+		}
+		_, err := c.Write(wire)
+		return err
+	}
 	reason := reasons[res.Status]
 	if reason == "" {
 		reason = "Unknown"

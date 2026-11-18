@@ -25,7 +25,7 @@ func dispatch(req *ForgeRequest) *ForgeResponse {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	requestID := store.RequestHeader()
-	rawPath, _, _ := strings.Cut(req.URL, "?")
+	rawPath, rawQuery, _ := strings.Cut(req.URL, "?")
 	authorized := func() bool { return tokenIsAuthorized(req.Headers["authorization"]) }
 	if req.Method == "GET" && strings.HasPrefix(rawPath, "/api/v3/repos/") {
 		if m := hotIssuePattern.FindStringSubmatch(rawPath); m != nil && authorized() {
@@ -58,6 +58,19 @@ func dispatch(req *ForgeRequest) *ForgeResponse {
 			}
 			return createIssueFast(decodeSegment(m[1]), decodeSegment(m[2]), req.Body, requestID)
 		}
+	}
+	if isGitRoute(rawPath) {
+		if !authorized() {
+			return fail(401, "Bad credentials", requestID)
+		}
+		var data []byte
+		if req.Method == "POST" {
+			if req.BodyError {
+				return fail(413, "Request body too large", requestID)
+			}
+			data = req.Body
+		}
+		return handleGit(req, rawPath, rawQuery, data)
 	}
 	host, ok := req.Headers["host"]
 	if !ok {

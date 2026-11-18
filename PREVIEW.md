@@ -1,10 +1,12 @@
-# Go forge preview — turns 1 and 2
+# Go forge preview — turns 1, 2, and 3
 
 Turn 1 ports the deterministic scenario, shared store, HTTP transport, process
 lifecycle, and every REST route in `lib/rest.ts`. Turn 2 ports the checked-in
 `lib/gitpack.ts` and `lib/gitproto.ts`, including their observable limitations.
-The existing TypeScript entry point remains the reference. GraphQL, MCP, and
-the thin `main.ts` binary launcher are reserved for the following turns.
+Turn 3 ports GraphQL and MCP, replaces `main.ts` with the thin binary launcher,
+and removes `app.ts` and the entire `lib/` directory. Parity tests recover the
+unchanged TypeScript reference from commit `d9b97e1` into a temporary directory;
+no TypeScript implementation remains in the current tree.
 
 **This is a source-parity preview. The checked-in TypeScript fails real Git
 clone/fetch and reports a sideband error after applying pushes; Go reproduces
@@ -17,7 +19,7 @@ The preview has no Go module dependencies. On the supplied Linux amd64 toolchain
 ```sh
 export PATH=/home/hatch/workspace/tools/go/bin:$PATH
 GOPROXY=off CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o forge .
-MAKEFUN_ENV_URL=http://127.0.0.1:COORDINATOR_PORT MAKEFUN_SHOP_TOKEN=TOKEN ./forge
+MAKEFUN_ENV_URL=http://127.0.0.1:COORDINATOR_PORT MAKEFUN_SHOP_TOKEN=TOKEN node main.ts
 ```
 
 `forge` listens on an ephemeral port on `127.0.0.1`, posts `{"port":N}` to the
@@ -25,7 +27,9 @@ coordinator's `/register`, and polls `/done`. Its in-memory state starts empty.
 No competition submission is performed by the binary or the preview checks.
 
 The committed preview binary is a stripped, statically linked Linux amd64 ELF,
-7,303,328 bytes, built with Go 1.27.4 and `CGO_ENABLED=0`.
+7,446,688 bytes, built with Go 1.27.4 and `CGO_ENABLED=0`, committed as mode
+`100755`. The launcher locates it relative to its own file, inherits environment
+and stdio, waits for the child, and returns its exit code. Spawn failure exits 1.
 
 ## Files
 
@@ -36,6 +40,11 @@ The committed preview binary is a stripped, statically linked Linux amd64 ELF,
   chunked bodies and trailers, framing validation, and the 2,000,000-byte limit.
 - `main.go`: coordinator registration, completion polling, and process exits.
 - `rest.go`: application routing, REST resources, diffs, and merge semantics.
+- `graphql.go`: the source tokenizer/parser, projections, introspection, node IDs,
+  mutations, batching, coercion, field ordering, and error envelopes.
+- `mcp.go`: JSON-RPC, protocol discovery/initialization, six tool schemas and
+  calls, and MCP-specific public object serialization.
+- `main.ts`: the nine-line Node standard-library launcher.
 - `json.go`, `url.go`: ordered JSON, JavaScript coercions and JSON diagnostics,
   Unicode handling, URL normalization, and ordered pagination query encoding.
 - `gitpack.go`: pkt-lines, sideband framing, ordered reachability, pack checksums,
@@ -58,12 +67,15 @@ route-specific newline behavior, without automatic Date headers or HTML escaping
 ```sh
 python3 tests/preview.py
 python3 tests/git_preview.py
+python3 tests/api_preview.py
+python3 tests/launcher_preview.py
 GOPROXY=off go test -count=1 ./...
 GOPROXY=off CGO_ENABLED=1 go test -race -count=1 ./...
 GOPROXY=off go vet ./...
 ```
 
-The offline harness starts Go and TypeScript against a local stub coordinator.
+The offline harness starts the Go binary through `node main.ts` and the
+historical TypeScript reference against a local stub coordinator.
 Its 390 checks cover response status, ordered headers and raw JSON bytes, REST
 mutations, git object hashes, pagination, Unicode, malformed JSON, URL handling,
 raw request framing, overflow draining, and lifecycle status/retry behavior.
@@ -91,10 +103,13 @@ The [Node-bundled algorithm](https://github.com/nodejs/node/tree/v22.21.0/deps/z
 is the compression reference; the executable uses only Go standard-library
 imports and performs compression locally.
 
-Final validation passed all 637 harness checks on both the static binary and a
-separate race-instrumented binary, plus all five Go tests under the race detector
-and `go vet ./...`. No race reports were emitted. The source limitations above
-remain failures for real Git clients even though the parity comparisons pass.
+Turn 3 adds 195 GraphQL/MCP byte-parity checks and four launcher checks. Final
+validation passed all 836 checks. The 832 REST, git, GraphQL, and MCP checks also
+passed against a separate race-instrumented binary; all five Go tests passed
+under the race detector, and `go vet ./...` passed. No race reports were emitted.
+The source limitations remain failures for real Git clients even though parity
+comparisons pass. Launcher tests include execution from another working
+directory, inherited environment/stdio, child exit propagation, and spawn failure.
 
 Fetch caches hold fully sideband-framed bytes and prebuilt HTTP response bytes
 for keep-alive and close connections. Concurrent callers share the same
@@ -104,8 +119,8 @@ ancestry checks without changing traversal/error precedence.
 
 ## Turn 2 source conflicts, measured failures, and deferrals
 
-The requested expanded features are absent from this checkout. The checked-in
-TypeScript remains authoritative for this port; its files were not modified.
+The requested expanded features are absent from the reference. The historical
+TypeScript remains authoritative for this port; it was removed after validation.
 
 - Upload-pack always advertises protocol v2, regardless of Git-Protocol headers.
   Receive-pack always advertises v0 using the OID-patched template and the
@@ -132,9 +147,31 @@ TypeScript remains authoritative for this port; its files were not modified.
 - Depth-1 closure visits only the commit, root tree, and its immediate entries,
   as in the source. No recursive shallow-tree correction is introduced.
 
-## Source discrepancies and interpretation
+## Turn 3 source discrepancies and interpretation
 
-- `main.ts` retries transient registration and polling transport failures with
+- The GraphQL route in `app.ts` is `/api/graphql`, not `/graphql`. The latter
+  remains 404. The source uses a tokenizer/parser and field resolver, with no
+  query-prefix dispatch or normalized-query shortcut. Its root fields are
+  `viewer`, `repository`, `node`, and `__type`; no `users` root field is defined.
+- Node IDs use permissive base64 decoding and JavaScript numeric coercion.
+  Unknown/malformed IDs resolve to null or the mutation's existing not-found
+  error; there is no dedicated node-ID decoding error to invent.
+- MCP contains exactly the six advertised tools. Neither `exportState` nor
+  `exportRepoZip` exists in `lib/mcp.ts`, `lib/store.ts`, or another forge module.
+  Their requested canonical document and archive format therefore cannot be
+  determined from the source and remain deferred. They return the reference's
+  unknown-method/tool error. The kit environment owns its canonical `state.json`;
+  the local grade's live/replay comparison verifies that document independently.
+- MCP public issue/repository/pull shapes differ from REST in field order and
+  optional fields. MCP merge marks a pull closed/merged without making the
+  REST/GraphQL git merge. Those differences are retained.
+- All TypeScript implementation files were removed. `main.ts`, `LICENSE`,
+  `package.json`, `tsconfig.json`, README badges, and the referral line remain;
+  the badges/referral were compared byte for byte to the preceding commit.
+
+## Earlier source discrepancies and interpretation
+
+- The original TypeScript lifecycle retries registration/polling failures with
   delays of 200, 400, 800, 1,600, then 2,000 ms. This differs from the brief's
   approximately 250 ms polling / transport-error exit description. The Go port
   follows the TypeScript: registration HTTP 400/405 exits 1, HTTP 200/409 succeeds,
@@ -145,3 +182,48 @@ TypeScript remains authoritative for this port; its files were not modified.
   endpoint or snapshot format. No new wire-visible export format is invented.
   The singleton, counters, insertion order, fixed timestamps, and serialization
   remain deterministic; there is no advancing logical timestamp in the source.
+
+## Turn 3 kit local grade
+
+The final code snapshot was graded through the kit's Node `main.ts` entrypoint,
+on one practice instance with the live run and the kit's replay check:
+
+```sh
+node /home/hatch/workspace/makefun/projects/github-core-clone-01/kit-fresh-1118/github-core-clone-01-kit/cli/makefun.mjs grade-local \
+  --kit /home/hatch/workspace/makefun/projects/github-core-clone-01/kit-fresh-1118/github-core-clone-01-kit \
+  --bot /home/hatch/workspace/makefun/projects/github-core-clone-01/entry-go \
+  --worktree --driver process --instances 1 \
+  --save /home/hatch/workspace/makefun/projects/github-core-clone-01/go-turn3-grade-final --json
+```
+
+The Docker-driver invocation was attempted first and could not run: this host
+has no Docker engine or executable. The process driver runs the entry and suite
+unisolated on loopback. The kit also reports this exact runtime mismatch:
+`node: the server's harness runs v26.13.1, this one v22.21.0`.
+These are local validation figures, not official results or a ranking forecast.
+
+| Column | Final local value |
+| --- | ---: |
+| score | 989 |
+| feature | 600 |
+| agent | 200 |
+| perf | 189 |
+| perf_p50_us | 218344 |
+| working | 1 |
+
+All 120 conformance checks passed: git 30/30, GraphQL 20/20, issues 15/15,
+MCP 15/15, protocol 5/5, pulls 20/20, repositories 15/15.
+**Failed feature or agent checks: none.**
+
+Replay finished successfully and L1 reproduced. Both live and replay state
+documents have SHA-256
+`a0e98d49854b961230227867235c8615858e006db3763f341ac6154af1445590`.
+The final workload points were push 50, clone 39, read 50, write 50. An earlier
+local run scored 987 with the same 120 passing checks; the performance difference
+is a local timing measurement, not a functional improvement claim.
+
+The retained run is in the sibling `go-turn3-grade-final/` directory, including
+`summary.json`, `trial-0/state/state.json`, and `trial-0/state/perf.json`. No model
+requests were made. Transcripts were not attached to this local preview run, so
+its eligibility metadata records `no_transcripts`, `coverage_below_gate`, and
+`cost_unpriced`; it is not a submission or transcript-eligibility check.

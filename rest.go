@@ -16,11 +16,6 @@ var issueDotPattern = regexp.MustCompile(`(?i)/(?:\.|%2e){1,2}/`)
 var lastIssueHost string
 var hasLastIssueHost bool
 
-// Later protocol ports can install handlers without changing REST transport.
-type routeHandler func(*ForgeRequest, *forgeURL, string) *ForgeResponse
-
-var protocolHandlers []routeHandler
-
 func dispatch(req *ForgeRequest) *ForgeResponse {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -89,10 +84,27 @@ func dispatch(req *ForgeRequest) *ForgeResponse {
 		}
 		return sendJSON(200, obj("current_user_url", "/api/v3/user", "rate_limit_url", "/api/v3/rate_limit"), requestID, header{"x-oauth-scopes", "repo, read:org"})
 	}
-	for _, handler := range protocolHandlers {
-		if res := handler(req, u, requestID); res != nil {
-			return res
+	if u.Pathname == "/mcp" && req.Method == "POST" {
+		if req.BodyError {
+			return fail(400, "Request body too large", requestID)
 		}
+		return handleMcp(req.Body, authorized())
+	}
+	if u.Pathname == "/api/graphql" && req.Method == "POST" {
+		if !authorized() {
+			return fail(401, "Bad credentials", requestID)
+		}
+		if req.BodyError {
+			return fail(413, "Request body too large", requestID)
+		}
+		if strings.Contains(req.Headers["content-type"], "json") {
+			valid := false
+			func() { defer func() { _ = recover() }(); parseJSON(req.Body); valid = true }()
+			if !valid {
+				return fail(400, "Invalid JSON body", requestID)
+			}
+		}
+		return handleGraphql(req.Body, requestID)
 	}
 	if strings.HasPrefix(u.Pathname, "/api/") {
 		if !authorized() {

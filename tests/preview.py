@@ -12,13 +12,19 @@ import json
 import os
 from pathlib import Path
 import random
+import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 
+sys.dont_write_bytecode = True
+from reference import source_reference
+
 ROOT = Path(__file__).resolve().parents[1]
-FORGE_BINARY = os.environ.get('FORGE_PREVIEW_BINARY', './forge')
+FORGE_BINARY = os.environ.get('FORGE_PREVIEW_BINARY', str(ROOT / 'forge'))
+FORGE_COMMAND = [FORGE_BINARY] if os.environ.get('FORGE_PREVIEW_BINARY') else ['node', str(ROOT / 'main.ts')]
 PORTS = {}
 DONE = False
 REGISTRATIONS = []
@@ -50,11 +56,13 @@ def main():
     processes = []
     checks = 0
     failures = []
+    reference = source_reference()
+    reference_root = reference.__enter__()
     try:
-        for key, command in [('go', [FORGE_BINARY]), ('ts', ['node', '--experimental-strip-types', 'main.ts'])]:
+        for key, command in [('go', FORGE_COMMAND), ('ts', ['node', '--experimental-strip-types', 'main.ts'])]:
             env = dict(os.environ, MAKEFUN_ENV_URL=f'http://127.0.0.1:{coordinator.server_port}/{key}',
                        MAKEFUN_SHOP_TOKEN='preview-secret', NODE_NO_WARNINGS='1')
-            processes.append(subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+            processes.append(subprocess.Popen(command, cwd=ROOT if key == 'go' else reference_root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True))
         deadline = time.monotonic() + 30
         while len(PORTS) < 2 and time.monotonic() < deadline:
             if any(p.poll() is not None for p in processes):
@@ -327,7 +335,7 @@ def main():
             assert code == 0, (code, process.stderr.read())
         checks += 1
         print('PASS: coordinator done=true shuts both servers down with exit 0', flush=True)
-        missing = subprocess.run([FORGE_BINARY], cwd=ROOT, env={k: v for k, v in os.environ.items() if k != 'MAKEFUN_ENV_URL'}, capture_output=True)
+        missing = subprocess.run(FORGE_COMMAND, cwd=ROOT, env=dict({k: v for k, v in os.environ.items() if k != 'MAKEFUN_ENV_URL'}, NODE_NO_WARNINGS='1'), capture_output=True)
         assert missing.returncode == 1 and missing.stderr == b'MAKEFUN_ENV_URL is not set\n'
         checks += 1
         # Verify lifecycle status handling, retry timing, and strict done JSON.
@@ -361,8 +369,8 @@ def main():
         threading.Thread(target=lifecycle.serve_forever, daemon=True).start()
         try:
             for case in ['reject400', 'reject405', 'conflict', 'retry']:
-                result = subprocess.run([FORGE_BINARY], cwd=ROOT,
-                    env=dict(os.environ, MAKEFUN_ENV_URL=f'http://127.0.0.1:{lifecycle.server_port}/{case}'),
+                result = subprocess.run(FORGE_COMMAND, cwd=ROOT,
+                    env=dict(os.environ, MAKEFUN_ENV_URL=f'http://127.0.0.1:{lifecycle.server_port}/{case}', NODE_NO_WARNINGS='1'),
                     capture_output=True, timeout=15)
                 if case.startswith('reject'):
                     assert result.returncode == 1 and result.stderr == f'Registration rejected with HTTP {case[6:]}\n'.encode()
@@ -381,9 +389,10 @@ def main():
         DONE = True
         for process in processes:
             if process.poll() is None:
-                process.kill()
+                os.killpg(process.pid, signal.SIGKILL)
             process.communicate(timeout=5)
         coordinator.shutdown()
+        reference.__exit__(None, None, None)
 
 
 if __name__ == '__main__':

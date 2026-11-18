@@ -8,6 +8,7 @@ import http.server
 import json
 import os
 import random
+import signal
 from pathlib import Path
 import socket
 import struct
@@ -85,11 +86,13 @@ def main():
     counts = {'http': 0, 'cli': 0, 'pack': 0, 'concurrent': 0}
     failures, source_limits = [], []
     recordings = {'go': [], 'ts': []}
+    reference_context = preview.source_reference()
+    reference_root = reference_context.__enter__()
     try:
-        for key, args in [('go', [BINARY]), ('ts', ['node', '--experimental-strip-types', 'main.ts'])]:
+        for key, args in [('go', preview.FORGE_COMMAND), ('ts', ['node', '--experimental-strip-types', 'main.ts'])]:
             env = dict(os.environ, MAKEFUN_ENV_URL=f'http://127.0.0.1:{coordinator.server_port}/{key}',
                        MAKEFUN_SHOP_TOKEN='preview-secret', NODE_NO_WARNINGS='1')
-            processes.append(subprocess.Popen(args, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+            processes.append(subprocess.Popen(args, cwd=ROOT if key == 'go' else reference_root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True))
         deadline = time.monotonic() + 30
         while len(preview.PORTS) < 2 and time.monotonic() < deadline:
             assert all(p.poll() is None for p in processes)
@@ -371,13 +374,14 @@ def main():
         preview.DONE = True
         for p in processes:
             if p.poll() is None:
-                p.kill()
+                os.killpg(p.pid, signal.SIGKILL)
             p.communicate(timeout=5)
         for p in proxies:
             p.shutdown()
             p.server_close()
         coordinator.shutdown()
         coordinator.server_close()
+        reference_context.__exit__(None, None, None)
 
 
 if __name__ == '__main__':

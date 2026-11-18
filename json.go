@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf16"
@@ -27,12 +28,107 @@ func obj(pairs ...any) object {
 }
 
 type rawJSON []byte
+type jsUndefined struct{}
+type jsFunction struct{}
+
+var undefinedValue any = jsUndefined{}
+
+func isNullish(v any) bool {
+	if v == nil {
+		return true
+	}
+	_, ok := v.(jsUndefined)
+	return ok
+}
+func isOmitted(v any) bool {
+	switch v.(type) {
+	case jsUndefined, jsFunction:
+		return true
+	}
+	return false
+}
+
+type inputObject struct {
+	values body
+	keys   []string
+}
+
+func newInputObject() *inputObject { return &inputObject{values: make(body)} }
+func (o *inputObject) set(k string, v any) {
+	if _, ok := o.values[k]; !ok {
+		o.keys = append(o.keys, k)
+	}
+	o.values[k] = v
+}
+func (o *inputObject) ordered() object {
+	out := make(object, 0, len(o.keys))
+	for _, k := range o.keys {
+		out = append(out, field{k, o.values[k]})
+	}
+	return out
+}
+func setObjectField(o object, key string, value any) object {
+	if key == "__proto__" {
+		return o
+	}
+	for i := range o {
+		if o[i].name == key {
+			o[i].value = value
+			return o
+		}
+	}
+	return append(o, field{key, value})
+}
+func objectIndex(key string) (uint64, bool) {
+	if key == "" || key[0] < '0' || key[0] > '9' || len(key) > 10 || len(key) > 1 && key[0] == '0' {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(key, 10, 32)
+	return n, err == nil && n < 1<<32-1 && strconv.FormatUint(n, 10) == key
+}
+func jsonFieldOrder(o object) object {
+	found := false
+	for _, f := range o {
+		if _, ok := objectIndex(f.name); ok {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return o
+	}
+	out := slices.Clone(o)
+	slices.SortStableFunc(out, func(a, b field) int {
+		an, ai := objectIndex(a.name)
+		bn, bi := objectIndex(b.name)
+		if ai && bi {
+			if an < bn {
+				return -1
+			}
+			if an > bn {
+				return 1
+			}
+		} else if ai {
+			return -1
+		} else if bi {
+			return 1
+		}
+		return 0
+	})
+	return out
+}
 
 func jsonBytes(value any) []byte { return appendJSON(make([]byte, 0, 256), value) }
 func appendJSON(b []byte, value any) []byte {
 	switch v := value.(type) {
 	case nil:
 		return append(b, "null"...)
+	case jsUndefined, jsFunction:
+		return append(b, "null"...)
+	case *inputObject:
+		return appendJSON(b, v.ordered())
+	case graphValue:
+		return appendJSON(b, v.serialized())
 	case rawJSON:
 		return append(b, v...)
 	case string:
@@ -52,10 +148,15 @@ func appendJSON(b []byte, value any) []byte {
 		return append(b, jsNumberString(v)...)
 	case object:
 		b = append(b, '{')
-		for i, f := range v {
-			if i > 0 {
+		first := true
+		for _, f := range jsonFieldOrder(v) {
+			if isOmitted(f.value) {
+				continue
+			}
+			if !first {
 				b = append(b, ',')
 			}
+			first = false
 			b = appendJSONString(b, f.name)
 			b = append(b, ':')
 			b = appendJSON(b, f.value)
@@ -180,6 +281,8 @@ func jsString(value any) string {
 	switch v := value.(type) {
 	case nil:
 		return "null"
+	case jsUndefined:
+		return "undefined"
 	case string:
 		return v
 	case bool:
@@ -191,7 +294,7 @@ func jsString(value any) string {
 	case []any:
 		a := make([]string, len(v))
 		for i, x := range v {
-			if x != nil {
+			if !isNullish(x) {
 				a[i] = jsString(x)
 			}
 		}
@@ -201,11 +304,16 @@ func jsString(value any) string {
 			panic("Cannot convert object to primitive value")
 		}
 		return "[object Object]"
+	case *inputObject:
+		return jsString(v.values)
 	default:
 		return "[object Object]"
 	}
 }
 func jsTruthy(v any) bool {
+	if isNullish(v) {
+		return false
+	}
 	switch x := v.(type) {
 	case nil:
 		return false
@@ -221,6 +329,9 @@ func jsTruthy(v any) bool {
 	return true
 }
 func jsNumber(v any) float64 {
+	if _, ok := v.(jsUndefined); ok {
+		return math.NaN()
+	}
 	if v == nil {
 		return 0
 	}
@@ -276,7 +387,7 @@ func jsNumber(v any) float64 {
 type body map[string]any
 
 func (b body) str(key, fallback string) string {
-	if b[key] == nil {
+	if isNullish(b[key]) {
 		return fallback
 	}
 	return jsString(b[key])
@@ -308,8 +419,8 @@ func parseBody(data []byte) body {
 		return body{}
 	}
 	v := parseJSON(data)
-	if b, ok := v.(body); ok {
-		return b
+	if b, ok := v.(*inputObject); ok {
+		return b.values
 	}
 	return body{}
 }
@@ -374,7 +485,7 @@ func (p *jsonParser) value() any {
 	case '{':
 		p.at++
 		p.ws()
-		out := body{}
+		out := newInputObject()
 		if p.at < len(p.data) && p.data[p.at] == '}' {
 			p.at++
 			return out
@@ -389,7 +500,7 @@ func (p *jsonParser) value() any {
 				p.fail("Expected ':' after property name")
 			}
 			p.at++
-			out[key] = p.value()
+			out.set(key, p.value())
 			p.ws()
 			if p.at < len(p.data) && p.data[p.at] == '}' {
 				p.at++
